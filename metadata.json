@@ -1,0 +1,6 @@
+{
+  "name": "Harmoniq - AI Music Theory & Visualization Studio",
+  "description": "Interactive music theory visualizer for scales, chords, guitar fretboard, piano, circle of fifths, AI harmony mentor, and high-res diagram generator.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
