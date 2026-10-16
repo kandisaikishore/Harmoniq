@@ -11,15 +11,19 @@ const PORT = Number(process.env.PORT) || 3000;
 
 app.use(express.json({ limit: '15mb' }));
 
-// Shared Gemini client with telemetry header as required by guidelines
-const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY,
-  httpOptions: {
-    headers: {
-      'User-Agent': 'aistudio-build',
-    },
-  },
-});
+// Initialize the SDK lazily so the app can start without an API key.
+let aiClient: GoogleGenAI | null = null;
+const getAIClient = (): GoogleGenAI | null => {
+  const apiKey = process.env.GEMINI_API_KEY?.trim();
+  if (!apiKey) return null;
+  if (!aiClient) {
+    aiClient = new GoogleGenAI({
+      apiKey,
+      httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
+    });
+  }
+  return aiClient;
+};
 
 // System instructions per role for chatbot
 const ROLE_SYSTEM_INSTRUCTIONS: Record<string, string> = {
@@ -52,9 +56,10 @@ app.post('/api/chat', async (req, res) => {
   try {
     const { messages, model, role } = req.body;
 
-    if (!process.env.GEMINI_API_KEY) {
-      return res.status(500).json({
-        error: 'GEMINI_API_KEY is not configured on the server. Please check the Secrets panel in AI Studio.'
+    const ai = getAIClient();
+    if (!ai) {
+      return res.status(503).json({
+        error: 'AI features are unavailable because GEMINI_API_KEY is not configured on the server.'
       });
     }
 
@@ -66,16 +71,31 @@ app.post('/api/chat', async (req, res) => {
 
     const systemInstruction = ROLE_SYSTEM_INSTRUCTIONS[role] || ROLE_SYSTEM_INSTRUCTIONS.maestro;
 
-    // Format messages for @google/genai SDK
+    // Validate client-supplied history before sending it to the AI provider.
+    if (!Array.isArray(messages) || messages.length === 0) {
+      return res.status(400).json({ error: 'At least one chat message is required.' });
+    }
+    if (messages.length > 40) {
+      return res.status(413).json({ error: 'A conversation can contain at most 40 messages per request.' });
+    }
+
+    const validMessages: { role: 'user' | 'assistant'; content: string }[] = [];
+    for (const message of messages) {
+      if (!message || (message.role !== 'user' && message.role !== 'assistant') ||
+          typeof message.content !== 'string' || !message.content.trim()) {
+        return res.status(400).json({ error: 'Each message must have a valid role and non-empty text content.' });
+      }
+      if (message.content.length > 12000) {
+        return res.status(413).json({ error: 'Each chat message must be 12,000 characters or fewer.' });
+      }
+      validMessages.push({ role: message.role, content: message.content.trim() });
+    }
+
     // contents: [{ role: 'user' | 'model', parts: [{ text: string }] }]
-    const formattedContents = (messages || []).map((msg: { role: string; content: string }) => ({
+    const formattedContents = validMessages.map(msg => ({
       role: msg.role === 'assistant' ? 'model' : 'user',
       parts: [{ text: msg.content }],
     }));
-
-    if (formattedContents.length === 0) {
-      return res.status(400).json({ error: 'No messages provided.' });
-    }
 
     const response = await ai.models.generateContent({
       model: selectedModel,
@@ -89,9 +109,9 @@ app.post('/api/chat', async (req, res) => {
     const replyText = response.text || 'I could not generate an answer at this time.';
     res.json({ reply: replyText, modelUsed: selectedModel });
   } catch (error: any) {
-    console.error('Chat generation error:', error);
-    res.status(500).json({
-      error: error.message || 'Failed to generate chat response. Please try again.'
+    console.error('Chat generation failed:', error instanceof Error ? error.name : 'Unknown error');
+    res.status(502).json({
+      error: 'The AI provider could not complete the chat request. Please retry shortly.'
     });
   }
 });
@@ -101,14 +121,16 @@ app.post('/api/generate-image', async (req, res) => {
   try {
     const { prompt, imageSize, aspectRatio } = req.body;
 
-    if (!process.env.GEMINI_API_KEY) {
-      return res.status(500).json({
-        error: 'GEMINI_API_KEY is not configured on the server.'
-      });
+    const ai = getAIClient();
+    if (!ai) {
+      return res.status(503).json({ error: 'AI features are unavailable because GEMINI_API_KEY is not configured on the server.' });
     }
 
-    if (!prompt || typeof prompt !== 'string') {
-      return res.status(400).json({ error: 'A prompt is required to generate an image.' });
+    if (typeof prompt !== 'string' || !prompt.trim()) {
+      return res.status(400).json({ error: 'A non-empty prompt is required to generate an image.' });
+    }
+    if (prompt.trim().length > 2000) {
+      return res.status(413).json({ error: 'Image prompts must be 2,000 characters or fewer.' });
     }
 
     // Valid sizes: 1K, 2K, 4K as requested
@@ -184,9 +206,9 @@ app.post('/api/generate-image', async (req, res) => {
       explanation: textExplanation.trim(),
     });
   } catch (error: any) {
-    console.error('Image generation error:', error);
-    res.status(500).json({
-      error: error.message || 'Failed to generate image. Please check your model quota or try a different prompt.'
+    console.error('Image generation failed:', error instanceof Error ? error.name : 'Unknown error');
+    res.status(502).json({
+      error: 'The AI provider could not complete the image request. Check quota or try a revised prompt.'
     });
   }
 });
@@ -196,11 +218,18 @@ app.post('/api/generate-image', async (req, res) => {
 app.post('/api/parse-music-query', async (req, res) => {
   try {
     const { query } = req.body;
-    if (!query || typeof query !== 'string') {
-      return res.status(400).json({ error: 'Query is required.' });
+    if (typeof query !== 'string' || !query.trim()) {
+      return res.status(400).json({ error: 'A non-empty music query is required.' });
+    }
+    if (query.trim().length > 1000) {
+      return res.status(413).json({ error: 'Music queries must be 1,000 characters or fewer.' });
+    }
+    const ai = getAIClient();
+    if (!ai) {
+      return res.status(503).json({ error: 'AI features are unavailable because GEMINI_API_KEY is not configured on the server.' });
     }
 
-    const prompt = `Analyze this music request: "${query}".
+    const prompt = `Analyze this music request: "${query.trim()}".
 Identify:
 1. Is it asking about a "scale", a "chord", or a "progression"?
 2. What is the root note (e.g. C, C#, Db, D, D#, Eb, E, F, F#, Gb, G, G#, Ab, A, A#, Bb, B)?
@@ -231,8 +260,8 @@ Output strictly valid JSON with keys:
     const parsed = JSON.parse(rawText || '{}');
     res.json(parsed);
   } catch (error: any) {
-    console.error('Query parse error:', error);
-    res.status(500).json({ error: error.message || 'Failed to parse music query.' });
+    console.error('Music query parsing failed:', error instanceof Error ? error.name : 'Unknown error');
+    res.status(502).json({ error: 'The AI provider could not parse this music query. Please try a clearer description.' });
   }
 });
 
